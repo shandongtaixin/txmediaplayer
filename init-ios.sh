@@ -37,3 +37,10 @@ sh $TOOLS/pull-repo-ref.sh $IJK_FFMPEG_FORK ios/ffmpeg-i386 ${IJK_FFMPEG_LOCAL_R
 cd ios/ffmpeg-i386
 git checkout ${IJK_FFMPEG_COMMIT}
 cd -
+
+echo "== pull ffmpeg fork x86_64 =="
+sh $TOOLS/pull-repo-ref.sh $IJK_FFMPEG_FORK ios/ffmpeg-x86_64 ${IJK_FFMPEG_LOCAL_REPO}
+
+cd ios/ffmpeg-x86_64
+git checkout ${IJK_FFMPEG_COMMIT}
+cd -

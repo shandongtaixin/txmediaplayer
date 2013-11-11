@@ -5,7 +5,7 @@
 # export HAVE_IOS7_SDK=1 to prefer ios sdk7
 
 FF_ALL_ARCHS_IOS6_SDK="armv7 armv7s i386"
-FF_ALL_ARCHS_IOS7_SDK="armv7 armv7s arm64 x86_64"
+FF_ALL_ARCHS_IOS7_SDK="armv7 armv7s arm64 i386"
 
 FF_ALL_ARCHS=$FF_ALL_ARCHS_IOS6_SDK
 if [ "$HAVE_IOS7_SDK" == "1" ]; then

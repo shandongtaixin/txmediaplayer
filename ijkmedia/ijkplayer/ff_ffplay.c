@@ -21,40 +21,358 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+/**
+ * @file
+ * simple media player based on the FFmpeg libraries
+ */
+
 #include "ff_ffplay.h"
+#include "ff_ffplay_imp_inc.h"
 
+#ifdef FFP_SHOW_FPS
+static int g_fps_counter = 0;
+static int64_t g_fps_total_time = 0;
+#endif
+
+#ifdef FFP_MERGE /*- FFPMERGE BEGIN -----------------*/
+#include "config.h"
+#include <inttypes.h>
 #include <math.h>
-#include "ff_cmdutils.h"
-#include "ff_fferror.h"
+#include <limits.h>
+#include <signal.h>
+#include <stdint.h>
 
-// FIXME: 9 work around NDKr8e or gcc4.7 bug
-// isnan() may not recognize some double NAN, so we test both double and float
-#if defined(__ANDROID__)
-#ifdef isnan
-#undef isnan
+#include "libavutil/avstring.h"
+#include "libavutil/colorspace.h"
+#include "libavutil/mathematics.h"
+#include "libavutil/pixdesc.h"
+#include "libavutil/imgutils.h"
+#include "libavutil/dict.h"
+#include "libavutil/parseutils.h"
+#include "libavutil/samplefmt.h"
+#include "libavutil/avassert.h"
+#include "libavutil/time.h"
+#include "libavformat/avformat.h"
+#include "libavdevice/avdevice.h"
+#include "libswscale/swscale.h"
+#include "libavutil/opt.h"
+#include "libavcodec/avfft.h"
+#include "libswresample/swresample.h"
+
+#if CONFIG_AVFILTER
+# include "libavfilter/avcodec.h"
+# include "libavfilter/avfilter.h"
+# include "libavfilter/buffersink.h"
+# include "libavfilter/buffersrc.h"
 #endif
-#define isnan(x) (isnan((double)(x)) || isnanf((float)(x)))
+
+#include <SDL.h>
+#include <SDL_thread.h>
+
+#include "cmdutils.h"
+
+#include <assert.h>
+
+const char program_name[] = "ffplay";
+const int program_birth_year = 2003;
+
+#define MAX_QUEUE_SIZE (15 * 1024 * 1024)
+#define MIN_FRAMES 5
+
+/* SDL audio buffer size, in samples. Should be small to have precise
+   A/V sync as SDL does not have hardware buffer fullness info. */
+#define SDL_AUDIO_BUFFER_SIZE 1024
+
+/* no AV sync correction is done if below the minimum AV sync threshold */
+#define AV_SYNC_THRESHOLD_MIN 0.01
+/* AV sync correction is done if above the maximum AV sync threshold */
+#define AV_SYNC_THRESHOLD_MAX 0.1
+/* If a frame duration is longer than this, it will not be duplicated to compensate AV sync */
+#define AV_SYNC_FRAMEDUP_THRESHOLD 0.1
+/* no AV correction is done if too big error */
+#define AV_NOSYNC_THRESHOLD 10.0
+
+/* maximum audio speed change to get correct sync */
+#define SAMPLE_CORRECTION_PERCENT_MAX 10
+
+/* external clock speed adjustment constants for realtime sources based on buffer fullness */
+#define EXTERNAL_CLOCK_SPEED_MIN  0.900
+#define EXTERNAL_CLOCK_SPEED_MAX  1.010
+#define EXTERNAL_CLOCK_SPEED_STEP 0.001
+
+/* we use about AUDIO_DIFF_AVG_NB A-V differences to make the average */
+#define AUDIO_DIFF_AVG_NB   20
+
+/* polls for possible required screen refresh at least this often, should be less than 1/fps */
+#define REFRESH_RATE 0.01
+
+/* NOTE: the size must be big enough to compensate the hardware audio buffersize size */
+/* TODO: We assume that a decoded and resampled frame fits into this buffer */
+#define SAMPLE_ARRAY_SIZE (8 * 65536)
+
+#define CURSOR_HIDE_DELAY 1000000
+
+static int64_t sws_flags = SWS_BICUBIC;
+
+typedef struct MyAVPacketList {
+    AVPacket pkt;
+    struct MyAVPacketList *next;
+    int serial;
+} MyAVPacketList;
+
+typedef struct PacketQueue {
+    MyAVPacketList *first_pkt, *last_pkt;
+    int nb_packets;
+    int size;
+    int abort_request;
+    int serial;
+    SDL_mutex *mutex;
+    SDL_cond *cond;
+} PacketQueue;
+
+#define VIDEO_PICTURE_QUEUE_SIZE 3
+#define SUBPICTURE_QUEUE_SIZE 4
+
+typedef struct VideoPicture {
+    double pts;             // presentation timestamp for this picture
+    double duration;        // estimated duration based on frame rate
+    int64_t pos;            // byte position in file
+    SDL_Overlay *bmp;
+    int width, height; /* source height & width */
+    int allocated;
+    int reallocate;
+    int serial;
+
+    AVRational sar;
+} VideoPicture;
+
+typedef struct SubPicture {
+    double pts; /* presentation time stamp for this picture */
+    AVSubtitle sub;
+    int serial;
+} SubPicture;
+
+typedef struct AudioParams {
+    int freq;
+    int channels;
+    int64_t channel_layout;
+    enum AVSampleFormat fmt;
+    int frame_size;
+    int bytes_per_sec;
+} AudioParams;
+
+typedef struct Clock {
+    double pts;           /* clock base */
+    double pts_drift;     /* clock base minus time at which we updated the clock */
+    double last_updated;
+    double speed;
+    int serial;           /* clock is based on a packet with this serial */
+    int paused;
+    int *queue_serial;    /* pointer to the current packet queue serial, used for obsolete clock detection */
+} Clock;
+
+enum {
+    AV_SYNC_AUDIO_MASTER, /* default choice */
+    AV_SYNC_VIDEO_MASTER,
+    AV_SYNC_EXTERNAL_CLOCK, /* synchronize to an external clock */
+};
+
+typedef struct VideoState {
+    SDL_Thread *read_tid;
+    SDL_Thread *video_tid;
+    AVInputFormat *iformat;
+    int no_background;
+    int abort_request;
+    int force_refresh;
+    int paused;
+    int last_paused;
+    int queue_attachments_req;
+    int seek_req;
+    int seek_flags;
+    int64_t seek_pos;
+    int64_t seek_rel;
+    int read_pause_return;
+    AVFormatContext *ic;
+    int realtime;
+    int audio_finished;
+    int video_finished;
+
+    Clock audclk;
+    Clock vidclk;
+    Clock extclk;
+
+    int audio_stream;
+
+    int av_sync_type;
+
+    double audio_clock;
+    int audio_clock_serial;
+    double audio_diff_cum; /* used for AV difference average computation */
+    double audio_diff_avg_coef;
+    double audio_diff_threshold;
+    int audio_diff_avg_count;
+    AVStream *audio_st;
+    PacketQueue audioq;
+    int audio_hw_buf_size;
+    uint8_t silence_buf[SDL_AUDIO_BUFFER_SIZE];
+    uint8_t *audio_buf;
+    uint8_t *audio_buf1;
+    unsigned int audio_buf_size; /* in bytes */
+    unsigned int audio_buf1_size;
+    int audio_buf_index; /* in bytes */
+    int audio_write_buf_size;
+    int audio_buf_frames_pending;
+    AVPacket audio_pkt_temp;
+    AVPacket audio_pkt;
+    int audio_pkt_temp_serial;
+    int audio_last_serial;
+    struct AudioParams audio_src;
+#if CONFIG_AVFILTER
+    struct AudioParams audio_filter_src;
+#endif
+    struct AudioParams audio_tgt;
+    struct SwrContext *swr_ctx;
+    int frame_drops_early;
+    int frame_drops_late;
+    AVFrame *frame;
+    int64_t audio_frame_next_pts;
+
+    enum ShowMode {
+        SHOW_MODE_NONE = -1, SHOW_MODE_VIDEO = 0, SHOW_MODE_WAVES, SHOW_MODE_RDFT, SHOW_MODE_NB
+    } show_mode;
+    int16_t sample_array[SAMPLE_ARRAY_SIZE];
+    int sample_array_index;
+    int last_i_start;
+    RDFTContext *rdft;
+    int rdft_bits;
+    FFTSample *rdft_data;
+    int xpos;
+    double last_vis_time;
+
+    SDL_Thread *subtitle_tid;
+    int subtitle_stream;
+    AVStream *subtitle_st;
+    PacketQueue subtitleq;
+    SubPicture subpq[SUBPICTURE_QUEUE_SIZE];
+    int subpq_size, subpq_rindex, subpq_windex;
+    SDL_mutex *subpq_mutex;
+    SDL_cond *subpq_cond;
+
+    double frame_timer;
+    double frame_last_returned_time;
+    double frame_last_filter_delay;
+    int video_stream;
+    AVStream *video_st;
+    PacketQueue videoq;
+    int64_t video_current_pos;      // current displayed file pos
+    double max_frame_duration;      // maximum duration of a frame - above this, we consider the jump a timestamp discontinuity
+    VideoPicture pictq[VIDEO_PICTURE_QUEUE_SIZE];
+    int pictq_size, pictq_rindex, pictq_windex;
+    SDL_mutex *pictq_mutex;
+    SDL_cond *pictq_cond;
+#if !CONFIG_AVFILTER
+    struct SwsContext *img_convert_ctx;
+#endif
+    SDL_Rect last_display_rect;
+
+    char filename[1024];
+    int width, height, xleft, ytop;
+    int step;
+
+#if CONFIG_AVFILTER
+    AVFilterContext *in_video_filter;   // the first filter in the video chain
+    AVFilterContext *out_video_filter;  // the last filter in the video chain
+    AVFilterContext *in_audio_filter;   // the first filter in the audio chain
+    AVFilterContext *out_audio_filter;  // the last filter in the audio chain
+    AVFilterGraph *agraph;              // audio filter graph
 #endif
 
-#if defined(__ANDROID__)
-#define printf(...) ALOGD(__VA_ARGS__)
+    int last_video_stream, last_audio_stream, last_subtitle_stream;
+
+    SDL_cond *continue_read_thread;
+} VideoState;
+
+/* options specified by the user */
+static AVInputFormat *file_iformat;
+static const char *input_filename;
+static const char *window_title;
+static int fs_screen_width;
+static int fs_screen_height;
+static int default_width  = 640;
+static int default_height = 480;
+static int screen_width  = 0;
+static int screen_height = 0;
+static int audio_disable;
+static int video_disable;
+static int subtitle_disable;
+static int wanted_stream[AVMEDIA_TYPE_NB] = {
+    [AVMEDIA_TYPE_AUDIO]    = -1,
+    [AVMEDIA_TYPE_VIDEO]    = -1,
+    [AVMEDIA_TYPE_SUBTITLE] = -1,
+};
+static int seek_by_bytes = -1;
+static int display_disable;
+static int show_status = 1;
+static int av_sync_type = AV_SYNC_AUDIO_MASTER;
+static int64_t start_time = AV_NOPTS_VALUE;
+static int64_t duration = AV_NOPTS_VALUE;
+static int workaround_bugs = 1;
+static int fast = 0;
+static int genpts = 0;
+static int lowres = 0;
+static int error_concealment = 3;
+static int decoder_reorder_pts = -1;
+static int autoexit;
+static int exit_on_keydown;
+static int exit_on_mousedown;
+static int loop = 1;
+static int framedrop = -1;
+static int infinite_buffer = -1;
+static enum ShowMode show_mode = SHOW_MODE_NONE;
+static const char *audio_codec_name;
+static const char *subtitle_codec_name;
+static const char *video_codec_name;
+double rdftspeed = 0.02;
+static int64_t cursor_last_shown;
+static int cursor_hidden = 0;
+#if CONFIG_AVFILTER
+static char *vfilters = NULL;
+static char *afilters = NULL;
 #endif
 
-#define FFP_XPS_PERIOD (3)
-// #define FFP_SHOW_FPS
-// #define FFP_SHOW_VDPS
-// #define FFP_SHOW_AUDIO_DELAY
-// #define FFP_SHOW_DEMUX_CACHE
-// #define FFP_SHOW_PKT_RECYCLE
+/* current context */
+static int is_full_screen;
+static int64_t audio_callback_time;
 
-#define FFP_BUF_MSG_PERIOD (3)
-
+#endif
 static AVPacket flush_pkt;
+#ifdef FFP_MERGE
 
-// FFP_MERGE: cmp_audio_fmts
-// FFP_MERGE: get_valid_channel_layout
+#define FF_ALLOC_EVENT   (SDL_USEREVENT)
+#define FF_QUIT_EVENT    (SDL_USEREVENT + 2)
 
-static int packet_queue_put(PacketQueue *q, AVPacket *pkt);
+static SDL_Surface *screen;
+
+static inline
+int cmp_audio_fmts(enum AVSampleFormat fmt1, int64_t channel_count1,
+                   enum AVSampleFormat fmt2, int64_t channel_count2)
+{
+    /* If channel count == 1, planar and non-planar formats are the same */
+    if (channel_count1 == 1 && channel_count2 == 1)
+        return av_get_packed_sample_fmt(fmt1) != av_get_packed_sample_fmt(fmt2);
+    else
+        return channel_count1 != channel_count2 || fmt1 != fmt2;
+}
+
+static inline
+int64_t get_valid_channel_layout(int64_t channel_layout, int channels)
+{
+    if (channel_layout && av_get_channel_layout_nb_channels(channel_layout) == channels)
+        return channel_layout;
+    else
+        return 0;
+}
+#endif /*- FFPMERGE END -------------------*/
 
 static int packet_queue_put_private(PacketQueue *q, AVPacket *pkt)
 {
@@ -268,32 +586,331 @@ static int packet_queue_get_or_buffering(FFPlayer *ffp, PacketQueue *q, AVPacket
     return 1;
 }
 
-// FFP_MERGE: fill_rectangle
-// FFP_MERGE: fill_border
-// FFP_MERGE: ALPHA_BLEND
-// FFP_MERGE: RGBA_IN
-// FFP_MERGE: YUVA_IN
-// FFP_MERGE: YUVA_OUT
-// FFP_MERGE: BPP
-// FFP_MERGE: blend_subrect
+#ifdef FFP_MERGE /*- FFPMERGE BEGIN -----------------*/
+static inline void fill_rectangle(SDL_Surface *screen,
+                                  int x, int y, int w, int h, int color, int update)
+{
+    SDL_Rect rect;
+    rect.x = x;
+    rect.y = y;
+    rect.w = w;
+    rect.h = h;
+    SDL_FillRect(screen, &rect, color);
+    if (update && w > 0 && h > 0)
+        SDL_UpdateRect(screen, x, y, w, h);
+}
+
+/* draw only the border of a rectangle */
+static void fill_border(int xleft, int ytop, int width, int height, int x, int y, int w, int h, int color, int update)
+{
+    int w1, w2, h1, h2;
+
+    /* fill the background */
+    w1 = x;
+    if (w1 < 0)
+        w1 = 0;
+    w2 = width - (x + w);
+    if (w2 < 0)
+        w2 = 0;
+    h1 = y;
+    if (h1 < 0)
+        h1 = 0;
+    h2 = height - (y + h);
+    if (h2 < 0)
+        h2 = 0;
+    fill_rectangle(screen,
+                   xleft, ytop,
+                   w1, height,
+                   color, update);
+    fill_rectangle(screen,
+                   xleft + width - w2, ytop,
+                   w2, height,
+                   color, update);
+    fill_rectangle(screen,
+                   xleft + w1, ytop,
+                   width - w1 - w2, h1,
+                   color, update);
+    fill_rectangle(screen,
+                   xleft + w1, ytop + height - h2,
+                   width - w1 - w2, h2,
+                   color, update);
+}
+
+#define ALPHA_BLEND(a, oldp, newp, s)\
+((((oldp << s) * (255 - (a))) + (newp * (a))) / (255 << s))
+
+#define RGBA_IN(r, g, b, a, s)\
+{\
+    unsigned int v = ((const uint32_t *)(s))[0];\
+    a = (v >> 24) & 0xff;\
+    r = (v >> 16) & 0xff;\
+    g = (v >> 8) & 0xff;\
+    b = v & 0xff;\
+}
+
+#define YUVA_IN(y, u, v, a, s, pal)\
+{\
+    unsigned int val = ((const uint32_t *)(pal))[*(const uint8_t*)(s)];\
+    a = (val >> 24) & 0xff;\
+    y = (val >> 16) & 0xff;\
+    u = (val >> 8) & 0xff;\
+    v = val & 0xff;\
+}
+
+#define YUVA_OUT(d, y, u, v, a)\
+{\
+    ((uint32_t *)(d))[0] = (a << 24) | (y << 16) | (u << 8) | v;\
+}
+
+
+#define BPP 1
+
+static void blend_subrect(AVPicture *dst, const AVSubtitleRect *rect, int imgw, int imgh)
+{
+    int wrap, wrap3, width2, skip2;
+    int y, u, v, a, u1, v1, a1, w, h;
+    uint8_t *lum, *cb, *cr;
+    const uint8_t *p;
+    const uint32_t *pal;
+    int dstx, dsty, dstw, dsth;
+
+    dstw = av_clip(rect->w, 0, imgw);
+    dsth = av_clip(rect->h, 0, imgh);
+    dstx = av_clip(rect->x, 0, imgw - dstw);
+    dsty = av_clip(rect->y, 0, imgh - dsth);
+    lum = dst->data[0] + dsty * dst->linesize[0];
+    cb  = dst->data[1] + (dsty >> 1) * dst->linesize[1];
+    cr  = dst->data[2] + (dsty >> 1) * dst->linesize[2];
+
+    width2 = ((dstw + 1) >> 1) + (dstx & ~dstw & 1);
+    skip2 = dstx >> 1;
+    wrap = dst->linesize[0];
+    wrap3 = rect->pict.linesize[0];
+    p = rect->pict.data[0];
+    pal = (const uint32_t *)rect->pict.data[1];  /* Now in YCrCb! */
+
+    if (dsty & 1) {
+        lum += dstx;
+        cb += skip2;
+        cr += skip2;
+
+        if (dstx & 1) {
+            YUVA_IN(y, u, v, a, p, pal);
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+            cb[0] = ALPHA_BLEND(a >> 2, cb[0], u, 0);
+            cr[0] = ALPHA_BLEND(a >> 2, cr[0], v, 0);
+            cb++;
+            cr++;
+            lum++;
+            p += BPP;
+        }
+        for (w = dstw - (dstx & 1); w >= 2; w -= 2) {
+            YUVA_IN(y, u, v, a, p, pal);
+            u1 = u;
+            v1 = v;
+            a1 = a;
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+
+            YUVA_IN(y, u, v, a, p + BPP, pal);
+            u1 += u;
+            v1 += v;
+            a1 += a;
+            lum[1] = ALPHA_BLEND(a, lum[1], y, 0);
+            cb[0] = ALPHA_BLEND(a1 >> 2, cb[0], u1, 1);
+            cr[0] = ALPHA_BLEND(a1 >> 2, cr[0], v1, 1);
+            cb++;
+            cr++;
+            p += 2 * BPP;
+            lum += 2;
+        }
+        if (w) {
+            YUVA_IN(y, u, v, a, p, pal);
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+            cb[0] = ALPHA_BLEND(a >> 2, cb[0], u, 0);
+            cr[0] = ALPHA_BLEND(a >> 2, cr[0], v, 0);
+            p++;
+            lum++;
+        }
+        p += wrap3 - dstw * BPP;
+        lum += wrap - dstw - dstx;
+        cb += dst->linesize[1] - width2 - skip2;
+        cr += dst->linesize[2] - width2 - skip2;
+    }
+    for (h = dsth - (dsty & 1); h >= 2; h -= 2) {
+        lum += dstx;
+        cb += skip2;
+        cr += skip2;
+
+        if (dstx & 1) {
+            YUVA_IN(y, u, v, a, p, pal);
+            u1 = u;
+            v1 = v;
+            a1 = a;
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+            p += wrap3;
+            lum += wrap;
+            YUVA_IN(y, u, v, a, p, pal);
+            u1 += u;
+            v1 += v;
+            a1 += a;
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+            cb[0] = ALPHA_BLEND(a1 >> 2, cb[0], u1, 1);
+            cr[0] = ALPHA_BLEND(a1 >> 2, cr[0], v1, 1);
+            cb++;
+            cr++;
+            p += -wrap3 + BPP;
+            lum += -wrap + 1;
+        }
+        for (w = dstw - (dstx & 1); w >= 2; w -= 2) {
+            YUVA_IN(y, u, v, a, p, pal);
+            u1 = u;
+            v1 = v;
+            a1 = a;
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+
+            YUVA_IN(y, u, v, a, p + BPP, pal);
+            u1 += u;
+            v1 += v;
+            a1 += a;
+            lum[1] = ALPHA_BLEND(a, lum[1], y, 0);
+            p += wrap3;
+            lum += wrap;
+
+            YUVA_IN(y, u, v, a, p, pal);
+            u1 += u;
+            v1 += v;
+            a1 += a;
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+
+            YUVA_IN(y, u, v, a, p + BPP, pal);
+            u1 += u;
+            v1 += v;
+            a1 += a;
+            lum[1] = ALPHA_BLEND(a, lum[1], y, 0);
+
+            cb[0] = ALPHA_BLEND(a1 >> 2, cb[0], u1, 2);
+            cr[0] = ALPHA_BLEND(a1 >> 2, cr[0], v1, 2);
+
+            cb++;
+            cr++;
+            p += -wrap3 + 2 * BPP;
+            lum += -wrap + 2;
+        }
+        if (w) {
+            YUVA_IN(y, u, v, a, p, pal);
+            u1 = u;
+            v1 = v;
+            a1 = a;
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+            p += wrap3;
+            lum += wrap;
+            YUVA_IN(y, u, v, a, p, pal);
+            u1 += u;
+            v1 += v;
+            a1 += a;
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+            cb[0] = ALPHA_BLEND(a1 >> 2, cb[0], u1, 1);
+            cr[0] = ALPHA_BLEND(a1 >> 2, cr[0], v1, 1);
+            cb++;
+            cr++;
+            p += -wrap3 + BPP;
+            lum += -wrap + 1;
+        }
+        p += wrap3 + (wrap3 - dstw * BPP);
+        lum += wrap + (wrap - dstw - dstx);
+        cb += dst->linesize[1] - width2 - skip2;
+        cr += dst->linesize[2] - width2 - skip2;
+    }
+    /* handle odd height */
+    if (h) {
+        lum += dstx;
+        cb += skip2;
+        cr += skip2;
+
+        if (dstx & 1) {
+            YUVA_IN(y, u, v, a, p, pal);
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+            cb[0] = ALPHA_BLEND(a >> 2, cb[0], u, 0);
+            cr[0] = ALPHA_BLEND(a >> 2, cr[0], v, 0);
+            cb++;
+            cr++;
+            lum++;
+            p += BPP;
+        }
+        for (w = dstw - (dstx & 1); w >= 2; w -= 2) {
+            YUVA_IN(y, u, v, a, p, pal);
+            u1 = u;
+            v1 = v;
+            a1 = a;
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+
+            YUVA_IN(y, u, v, a, p + BPP, pal);
+            u1 += u;
+            v1 += v;
+            a1 += a;
+            lum[1] = ALPHA_BLEND(a, lum[1], y, 0);
+            cb[0] = ALPHA_BLEND(a1 >> 2, cb[0], u, 1);
+            cr[0] = ALPHA_BLEND(a1 >> 2, cr[0], v, 1);
+            cb++;
+            cr++;
+            p += 2 * BPP;
+            lum += 2;
+        }
+        if (w) {
+            YUVA_IN(y, u, v, a, p, pal);
+            lum[0] = ALPHA_BLEND(a, lum[0], y, 0);
+            cb[0] = ALPHA_BLEND(a >> 2, cb[0], u, 0);
+            cr[0] = ALPHA_BLEND(a >> 2, cr[0], v, 0);
+        }
+    }
+}
+#endif /*- FFPMERGE END -------------------*/
 
 static void free_picture(VideoPicture *vp)
 {
-    if (vp->bmp) {
-        SDL_VoutFreeYUVOverlay(vp->bmp);
-        vp->bmp = NULL;
-    }
+     if (vp->bmp) {
+         SDL_VoutFreeYUVOverlay(vp->bmp);
+         vp->bmp = NULL;
+     }
 }
 
-// FFP_MERGE: free_subpicture
-// FFP_MERGE: calculate_display_rect
-// FFP_MERGE: video_image_display
+#ifdef FFP_MERGE /*- FFPMERGE BEGIN -----------------*/
+static void free_subpicture(SubPicture *sp)
+{
+    avsubtitle_free(&sp->sub);
+}
 
-#ifdef FFP_SHOW_FPS
-static int g_fps_counter = 0;
-static int64_t g_fps_total_time = 0;
-#endif
-static void video_image_display2(FFPlayer *ffp)
+static void calculate_display_rect(SDL_Rect *rect, int scr_xleft, int scr_ytop, int scr_width, int scr_height, VideoPicture *vp)
+{
+    float aspect_ratio;
+    int width, height, x, y;
+
+    if (vp->sar.num == 0)
+        aspect_ratio = 0;
+    else
+        aspect_ratio = av_q2d(vp->sar);
+
+    if (aspect_ratio <= 0.0)
+        aspect_ratio = 1.0;
+    aspect_ratio *= (float)vp->width / (float)vp->height;
+
+    /* XXX: we suppose the screen has a 1.0 pixel ratio */
+    height = scr_height;
+    width = ((int)rint(height * aspect_ratio)) & ~1;
+    if (width > scr_width) {
+        width = scr_width;
+        height = ((int)rint(width / aspect_ratio)) & ~1;
+    }
+    x = (scr_width - width) / 2;
+    y = (scr_height - height) / 2;
+    rect->x = scr_xleft + x;
+    rect->y = scr_ytop  + y;
+    rect->w = FFMAX(width,  1);
+    rect->h = FFMAX(height, 1);
+}
+#endif /*- FFPMERGE END -------------------*/
+
+static void video_image_display(FFPlayer *ffp)
 {
     VideoState *is = ffp->is;
     VideoPicture *vp;
@@ -324,8 +941,153 @@ static void video_image_display2(FFPlayer *ffp)
     }
 }
 
-// FFP_MERGE: compute_mod
-// FFP_MERGE: video_audio_display
+#ifdef FFP_MERGE /*- FFPMERGE BEGIN -----------------*/
+static inline int compute_mod(int a, int b)
+{
+    return a < 0 ? a%b + b : a%b;
+}
+
+static void video_audio_display(VideoState *s)
+{
+    int i, i_start, x, y1, y, ys, delay, n, nb_display_channels;
+    int ch, channels, h, h2, bgcolor, fgcolor;
+    int64_t time_diff;
+    int rdft_bits, nb_freq;
+
+    for (rdft_bits = 1; (1 << rdft_bits) < 2 * s->height; rdft_bits++)
+        ;
+    nb_freq = 1 << (rdft_bits - 1);
+
+    /* compute display index : center on currently output samples */
+    channels = s->audio_tgt.channels;
+    nb_display_channels = channels;
+    if (!s->paused) {
+        int data_used= s->show_mode == SHOW_MODE_WAVES ? s->width : (2*nb_freq);
+        n = 2 * channels;
+        delay = s->audio_write_buf_size;
+        delay /= n;
+
+        /* to be more precise, we take into account the time spent since
+           the last buffer computation */
+        if (audio_callback_time) {
+            time_diff = av_gettime() - audio_callback_time;
+            delay -= (time_diff * s->audio_tgt.freq) / 1000000;
+        }
+
+        delay += 2 * data_used;
+        if (delay < data_used)
+            delay = data_used;
+
+        i_start= x = compute_mod(s->sample_array_index - delay * channels, SAMPLE_ARRAY_SIZE);
+        if (s->show_mode == SHOW_MODE_WAVES) {
+            h = INT_MIN;
+            for (i = 0; i < 1000; i += channels) {
+                int idx = (SAMPLE_ARRAY_SIZE + x - i) % SAMPLE_ARRAY_SIZE;
+                int a = s->sample_array[idx];
+                int b = s->sample_array[(idx + 4 * channels) % SAMPLE_ARRAY_SIZE];
+                int c = s->sample_array[(idx + 5 * channels) % SAMPLE_ARRAY_SIZE];
+                int d = s->sample_array[(idx + 9 * channels) % SAMPLE_ARRAY_SIZE];
+                int score = a - d;
+                if (h < score && (b ^ c) < 0) {
+                    h = score;
+                    i_start = idx;
+                }
+            }
+        }
+
+        s->last_i_start = i_start;
+    } else {
+        i_start = s->last_i_start;
+    }
+
+    bgcolor = SDL_MapRGB(screen->format, 0x00, 0x00, 0x00);
+    if (s->show_mode == SHOW_MODE_WAVES) {
+        fill_rectangle(screen,
+                       s->xleft, s->ytop, s->width, s->height,
+                       bgcolor, 0);
+
+        fgcolor = SDL_MapRGB(screen->format, 0xff, 0xff, 0xff);
+
+        /* total height for one channel */
+        h = s->height / nb_display_channels;
+        /* graph height / 2 */
+        h2 = (h * 9) / 20;
+        for (ch = 0; ch < nb_display_channels; ch++) {
+            i = i_start + ch;
+            y1 = s->ytop + ch * h + (h / 2); /* position of center line */
+            for (x = 0; x < s->width; x++) {
+                y = (s->sample_array[i] * h2) >> 15;
+                if (y < 0) {
+                    y = -y;
+                    ys = y1 - y;
+                } else {
+                    ys = y1;
+                }
+                fill_rectangle(screen,
+                               s->xleft + x, ys, 1, y,
+                               fgcolor, 0);
+                i += channels;
+                if (i >= SAMPLE_ARRAY_SIZE)
+                    i -= SAMPLE_ARRAY_SIZE;
+            }
+        }
+
+        fgcolor = SDL_MapRGB(screen->format, 0x00, 0x00, 0xff);
+
+        for (ch = 1; ch < nb_display_channels; ch++) {
+            y = s->ytop + ch * h;
+            fill_rectangle(screen,
+                           s->xleft, y, s->width, 1,
+                           fgcolor, 0);
+        }
+        SDL_UpdateRect(screen, s->xleft, s->ytop, s->width, s->height);
+    } else {
+        nb_display_channels= FFMIN(nb_display_channels, 2);
+        if (rdft_bits != s->rdft_bits) {
+            av_rdft_end(s->rdft);
+            av_free(s->rdft_data);
+            s->rdft = av_rdft_init(rdft_bits, DFT_R2C);
+            s->rdft_bits = rdft_bits;
+            s->rdft_data = av_malloc(4 * nb_freq * sizeof(*s->rdft_data));
+        }
+        {
+            FFTSample *data[2];
+            for (ch = 0; ch < nb_display_channels; ch++) {
+                data[ch] = s->rdft_data + 2 * nb_freq * ch;
+                i = i_start + ch;
+                for (x = 0; x < 2 * nb_freq; x++) {
+                    double w = (x-nb_freq) * (1.0 / nb_freq);
+                    data[ch][x] = s->sample_array[i] * (1.0 - w * w);
+                    i += channels;
+                    if (i >= SAMPLE_ARRAY_SIZE)
+                        i -= SAMPLE_ARRAY_SIZE;
+                }
+                av_rdft_calc(s->rdft, data[ch]);
+            }
+            /* Least efficient way to do this, we should of course
+             * directly access it but it is more than fast enough. */
+            for (y = 0; y < s->height; y++) {
+                double w = 1 / sqrt(nb_freq);
+                int a = sqrt(w * sqrt(data[0][2 * y + 0] * data[0][2 * y + 0] + data[0][2 * y + 1] * data[0][2 * y + 1]));
+                int b = (nb_display_channels == 2 ) ? sqrt(w * sqrt(data[1][2 * y + 0] * data[1][2 * y + 0]
+                       + data[1][2 * y + 1] * data[1][2 * y + 1])) : a;
+                a = FFMIN(a, 255);
+                b = FFMIN(b, 255);
+                fgcolor = SDL_MapRGB(screen->format, a, b, (a + b) / 2);
+
+                fill_rectangle(screen,
+                            s->xpos, s->height-y, 1, 1,
+                            fgcolor, 0);
+            }
+        }
+        SDL_UpdateRect(screen, s->xpos, s->ytop, 1, s->height);
+        if (!s->paused)
+            s->xpos++;
+        if (s->xpos >= s->width)
+            s->xpos= s->xleft;
+    }
+}
+#endif /*- FFPMERGE END -------------------*/
 
 static void stream_close(FFPlayer *ffp)
 {
@@ -367,17 +1129,85 @@ static void stream_close(FFPlayer *ffp)
     av_free(is);
 }
 
-// FFP_MERGE: do_exit
-// FFP_MERGE: sigterm_handler
-// FFP_MERGE: video_open
-// FFP_MERGE: video_display
+#ifdef FFP_MERGE /*- FFPMERGE BEGIN -----------------*/
+static void do_exit(VideoState *is)
+{
+    if (is) {
+        stream_close(is);
+    }
+    av_lockmgr_register(NULL);
+    uninit_opts();
+#if CONFIG_AVFILTER
+    av_freep(&vfilters);
+#endif
+    avformat_network_deinit();
+    if (show_status)
+        printf("\n");
+    SDL_Quit();
+    av_log(NULL, AV_LOG_QUIET, "%s", "");
+    exit(0);
+}
+
+static void sigterm_handler(int sig)
+{
+    exit(123);
+}
+
+static void set_default_window_size(VideoPicture *vp)
+{
+    SDL_Rect rect;
+    calculate_display_rect(&rect, 0, 0, INT_MAX, vp->height, vp);
+    default_width  = rect.w;
+    default_height = rect.h;
+}
+
+static int video_open(VideoState *is, int force_set_video_mode, VideoPicture *vp)
+{
+    int flags = SDL_HWSURFACE | SDL_ASYNCBLIT | SDL_HWACCEL;
+    int w,h;
+
+    if (is_full_screen) flags |= SDL_FULLSCREEN;
+    else                flags |= SDL_RESIZABLE;
+
+    if (vp && vp->width)
+        set_default_window_size(vp);
+
+    if (is_full_screen && fs_screen_width) {
+        w = fs_screen_width;
+        h = fs_screen_height;
+    } else if (!is_full_screen && screen_width) {
+        w = screen_width;
+        h = screen_height;
+    } else {
+        w = default_width;
+        h = default_height;
+    }
+    w = FFMIN(16383, w);
+    if (screen && is->width == screen->w && screen->w == w
+       && is->height== screen->h && screen->h == h && !force_set_video_mode)
+        return 0;
+    screen = SDL_SetVideoMode(w, h, 0, flags);
+    if (!screen) {
+        av_log(NULL, AV_LOG_FATAL, "SDL: could not set video mode - exiting\n");
+        do_exit(is);
+    }
+    if (!window_title)
+        window_title = input_filename;
+    SDL_WM_SetCaption(window_title, window_title);
+
+    is->width  = screen->w;
+    is->height = screen->h;
+
+    return 0;
+}
+#endif /*- FFPMERGE END -------------------*/
 
 /* display the current picture, if any */
-static void video_display2(FFPlayer *ffp)
+static void video_display(FFPlayer *ffp)
 {
     VideoState *is = ffp->is;
     if (is->video_st)
-        video_image_display2(ffp);
+        video_image_display(ffp);
 }
 
 static double get_clock(Clock *c)
@@ -504,9 +1334,6 @@ static void stream_toggle_pause_l(FFPlayer *ffp, int pause_on)
         }
 #endif
         set_clock(&is->vidclk, get_clock(&is->vidclk), is->vidclk.serial);
-        // ALOGE("stream_toggle_pause_l: pause -> start\n");
-    } else {
-        // ALOGE("stream_toggle_pause_l: %d\n", pause_on);
     }
     set_clock(&is->extclk, get_clock(&is->extclk), is->extclk.serial);
     is->paused = is->audclk.paused = is->vidclk.paused = is->extclk.paused = pause_on;
@@ -596,7 +1423,6 @@ static double vp_duration(VideoState *is, VideoPicture *vp, VideoPicture *nextvp
     }
 }
 
-
 static void pictq_next_picture(VideoState *is) {
     /* update queue size and signal for next picture */
     if (++is->pictq_rindex == VIDEO_PICTURE_QUEUE_SIZE)
@@ -651,16 +1477,9 @@ static void video_refresh(FFPlayer *opaque, double *remaining_time)
     if (!ffp->display_disable && is->show_mode != SHOW_MODE_VIDEO && is->audio_st) {
         time = av_gettime() / 1000000.0;
         if (is->force_refresh || is->last_vis_time + ffp->rdftspeed < time) {
-            video_display2(ffp);
+            video_display(ffp);
             is->last_vis_time = time;
         }
-        /*
-        ALOGE("remaining[1] %.3f = FFMIN(%.3f, %.3f + %.3f - %.3f)\n",
-              *remaining_time,
-              is->last_vis_time,
-              ffp->rdftspeed,
-              time);
-        */
         *remaining_time = FFMIN(*remaining_time, is->last_vis_time + ffp->rdftspeed - time);
     }
 
@@ -733,7 +1552,7 @@ retry:
 display:
             /* display picture */
             if (!ffp->display_disable && is->show_mode == SHOW_MODE_VIDEO)
-                video_display2(ffp);
+                video_display(ffp);
 
             pictq_next_picture(is);
 
@@ -856,7 +1675,7 @@ static void duplicate_right_border_pixels(SDL_Overlay *bmp) {
 }
 #endif
 
-static int queue_picture(FFPlayer *ffp, AVFrame *src_frame, double pts, int64_t pos, int serial, int is_too_late)
+static int queue_picture(FFPlayer *ffp, AVFrame *src_frame, double pts, int64_t pos, double duration, int serial)
 {
     VideoState *is = ffp->is;
     VideoPicture *vp;
@@ -873,10 +1692,6 @@ static int queue_picture(FFPlayer *ffp, AVFrame *src_frame, double pts, int64_t 
     /* keep the last already displayed picture in the queue */
     while (is->pictq_size >= VIDEO_PICTURE_QUEUE_SIZE - 1 &&
            !is->videoq.abort_request) {
-        if (is_too_late) {
-            drop_frame = 1;
-            break;
-        }
         SDL_CondWait(is->pictq_cond, is->pictq_mutex);
     }
     SDL_UnlockMutex(is->pictq_mutex);
@@ -928,6 +1743,7 @@ static int queue_picture(FFPlayer *ffp, AVFrame *src_frame, double pts, int64_t 
         SDL_VoutUnlockYUVOverlay(vp->bmp);
 
         vp->pts = pts;
+        vp->duration = duration;
         vp->pos = pos;
         vp->serial = serial;
 
@@ -945,7 +1761,7 @@ static int queue_picture(FFPlayer *ffp, AVFrame *src_frame, double pts, int64_t 
 static int g_vdps_counter = 0;
 static int64_t g_vdps_total_time = 0;
 #endif
-static int get_video_frame(FFPlayer *ffp, AVFrame *frame, AVPacket *pkt, int *serial, int *is_too_late)
+static int get_video_frame(FFPlayer *ffp, AVFrame *frame, AVPacket *pkt, int *serial)
 {
     VideoState *is = ffp->is;
     int got_picture;
@@ -1239,8 +2055,7 @@ static int video_thread(void *arg)
 
         av_free_packet(&pkt);
 
-        int is_too_late = 0;
-        ret = get_video_frame(ffp, frame, &pkt, &serial, &is_too_late);
+        ret = get_video_frame(ffp, frame, &pkt, &serial);
         if (ret < 0)
             goto the_end;
         if (!ret)
